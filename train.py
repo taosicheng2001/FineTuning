@@ -13,6 +13,11 @@ from accelerate import Accelerator
 from config import TrainingConfig, DataConfig
 from data_processor import DataProcessor, create_data_collator
 from model_setup import setup_training_model, save_model
+from torch.profiler import ExecutionTraceObserver
+import torch
+import subprocess
+import glob
+import os
 
 
 def setup_wandb(config: TrainingConfig):
@@ -30,6 +35,80 @@ def setup_wandb(config: TrainingConfig):
             "lora_dropout": config.lora_dropout,
         }
     )
+
+
+def collect_chakra_trace(trainer, model, optimizer, trace_prefix, start_step=0, collect_steps=2):
+    """
+    采集Chakra Trace，trace_prefix为文件名前缀
+    """
+    et_file = f"{trace_prefix}_pytorch_et.json"
+    kineto_dir = f"./{trace_prefix}_kineto_trace"
+    et_plus_file = f"{trace_prefix}_pytorch_et_plus.json"
+    chakra_trace_file = f"{trace_prefix}_chakra_trace.json"
+
+    et = ExecutionTraceObserver()
+    et.register_callback(et_file)
+
+    prof = torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        schedule=torch.profiler.schedule(wait=0, warmup=0, active=collect_steps, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler(kineto_dir),
+        record_shapes=True,
+        with_stack=True
+    )
+
+    et.start()
+    prof.__enter__()
+
+    train_dataloader = trainer.get_train_dataloader()
+    model.train()
+    step_count = 0
+    for step, batch in enumerate(train_dataloader):
+        if step < start_step:
+            continue
+        batch = {k: v.to(model.device) for k, v in batch.items()}
+        outputs = model(**batch)
+        loss = outputs.loss
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        prof.step()
+        print(f"[{trace_prefix}] Trace Step {step+1}, loss: {loss.item():.4f}")
+        step_count += 1
+        if step_count >= collect_steps:
+            break
+
+    et.stop()
+    et.unregister_callback()
+    prof.__exit__(None, None, None)
+    print(f"{trace_prefix}: PyTorch ET和Kineto Trace采集完成，文件已保存。")
+
+    # 合并与转换
+    kineto_files = glob.glob(f'{kineto_dir}/*')
+    if kineto_files:
+        kineto_file = kineto_files[0]
+        print(f"{trace_prefix}: 合并 PyTorch ET 和 Kineto Trace 到 {et_plus_file} ...")
+        subprocess.run([
+            'chakra_trace_link',
+            '--et', et_file,
+            '--kineto', kineto_file,
+            '--output', et_plus_file
+        ], check=True)
+    else:
+        print(f"{trace_prefix}: 未找到Kineto Trace文件，跳过合并。")
+
+    if os.path.exists(et_plus_file):
+        print(f"{trace_prefix}: 转换为Chakra标准格式 {chakra_trace_file} ...")
+        subprocess.run([
+            'chakra_converter',
+            '--input', et_plus_file,
+            '--output', chakra_trace_file
+        ], check=True)
+    else:
+        print(f"{trace_prefix}: 未找到pytorch_et_plus.json，跳过转换。")
 
 
 def main():
@@ -103,9 +182,30 @@ def main():
         data_collator=data_collator,
         tokenizer=tokenizer,
     )
+    optimizer = trainer.create_optimizer()
     
-    # 开始训练
-    print("\n6. 开始训练...")
+    # ========== 采集最开始的Trace ==========
+    collect_chakra_trace(trainer, model, optimizer, trace_prefix='startup', start_step=0, collect_steps=2)
+
+    # ========== 训练10步 ==========
+    train_dataloader = trainer.get_train_dataloader()
+    model.train()
+    for step, batch in enumerate(train_dataloader):
+        batch = {k: v.to(model.device) for k, v in batch.items()}
+        outputs = model(**batch)
+        loss = outputs.loss
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        print(f"[Pre-Midrun] Step {step+1}, loss: {loss.item():.4f}")
+        if step >= 9:
+            break
+
+    # ========== 采集中间阶段的Trace ==========
+    collect_chakra_trace(trainer, model, optimizer, trace_prefix='midrun', start_step=step+1, collect_steps=2)
+
+    # 后续完整训练
+    print("\n继续完整训练...")
     trainer.train()
     
     # 保存模型
